@@ -3,8 +3,11 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
 // custom map type
@@ -15,75 +18,66 @@ func remove(slice []Problem, s int) []Problem {
 	return append(slice[:s], slice[s+1:]...)
 }
 
+func initDatabase() (db *gorm.DB, err error) {
+	dsn := "host=localhost user=postgres password=123456789 " +
+		"dbname=onlinejudge-go port=5432 sslmode=disable"
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+
+	// postgreDB, err := db.DB()
+	// postgreDB.SetConnMaxLifetime(time.Minute)
+	// // SetMaxIdleConns sets the maximum number of connections in the idle connection pool.
+	// postgreDB.SetMaxIdleConns(10)
+	// // SetMaxOpenConns sets the maximum number of open connections to the database.
+	// postgreDB.SetMaxOpenConns(100)
+
+	return db, err
+}
+
 func main() {
+	db, err := initDatabase()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// no transaction yet
+	db.AutoMigrate(&ProblemTable{}, &TestCaseTable{})
+
 	r := gin.Default()
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(200, "Hello, Jimmy_kiet.")
 	})
 
-	// fake data
-	var testProblems []Problem
-	p1t1 := TestCase{
-		Input:          "3 4",
-		ExpectedOutput: "7",
-		Comment:        "",
-		Score:          50,
-		TimeOutSeconds: 10.0,
-	}
-
-	p1t2 := TestCase{
-		Input:          "2147483646 1",
-		ExpectedOutput: "2147483647",
-		Comment:        "",
-		Score:          50,
-		TimeOutSeconds: 10.0,
-	}
-
-	p1 := Problem{
-		Id:          "101",
-		Title:       "A + B Problem",
-		Description: "輸入兩數，將兩數加總。",
-		TestCases:   []TestCase{p1t1, p1t2},
-	}
-
-	p2t1 := TestCase{
-		Input:          "3 4 5",
-		ExpectedOutput: "12",
-		Comment:        "",
-		Score:          50,
-		TimeOutSeconds: 10.0,
-	}
-
-	p2t2 := TestCase{
-		Input:          "2147483646 1 -1",
-		ExpectedOutput: "2147483646",
-		Comment:        "",
-		Score:          50,
-		TimeOutSeconds: 10.0,
-	}
-
-	p2 := Problem{
-		Id:          "102",
-		Title:       "A + B + C Problem",
-		Description: "輸入三數，將三數加總。",
-		TestCases:   []TestCase{p2t1, p2t2},
-	}
-
-	testProblems = append(testProblems, p1)
-	testProblems = append(testProblems, p2)
-
 	// group: problems
 	getProblemsHandler := func(c *gin.Context) {
-		// slice of map
 		var problems []problemsMap
-		for _, p := range testProblems {
-			temp := problemsMap{
-				"id":    p.Id,
-				"title": p.Title,
+
+		db.Transaction(func(tx *gorm.DB) error {
+			// do some database operations in the transaction (use 'tx' from this point, not 'db')
+			rows, err := tx.Model(&ProblemTable{}).Rows()
+			defer rows.Close()
+			if err != nil {
+				fmt.Println(err)
+				return err
 			}
-			problems = append(problems, temp)
-		}
+
+			for rows.Next() {
+				var problem ProblemTable
+				// ScanRows is a method of `gorm.DB`, it can be used to scan a row into a struct
+				tx.ScanRows(rows, &problem)
+
+				// do something
+				temp := problemsMap{
+					"id":    strconv.Itoa(problem.Id),
+					"title": problem.Title,
+				}
+				problems = append(problems, temp)
+			}
+
+			// return nil will commit the whole transaction
+			return nil
+		})
 
 		c.JSON(http.StatusOK, gin.H{
 			"data": problems,
@@ -91,50 +85,202 @@ func main() {
 	}
 
 	createProblemsHandler := func(c *gin.Context) {
-		var newProblem Problem
-		err := c.Bind(&newProblem)
+		var newProblemDTO ProblemPostDTO
+		var newProblem ProblemTable
+		var newProblemId int
+
+		err := c.Bind(&newProblemDTO)
 		if err != nil {
 			c.String(http.StatusBadRequest, fmt.Sprintf("create problem err: %s", err.Error()))
+			return
 		}
-		testProblems = append(testProblems, newProblem)
+		newProblem = ProblemTable{
+			Title:       newProblemDTO.Title,
+			Description: newProblemDTO.Description,
+		}
+
+		db.Transaction(func(tx *gorm.DB) error {
+			tx.Create(&newProblem)
+			newProblemId = newProblem.Id
+
+			for _, TestCase := range newProblemDTO.TestCases {
+				tempTestCase := TestCaseTable{
+					Input:          TestCase.Input,
+					ExpectedOutput: TestCase.ExpectedOutput,
+					Comment:        TestCase.Comment,
+					Score:          TestCase.Score,
+					TimeOutSeconds: TestCase.TimeOutSeconds,
+					ProblemId:      newProblemId,
+				}
+				tx.Create(&tempTestCase)
+			}
+
+			return nil
+		})
 
 		c.JSON(http.StatusOK, gin.H{
-			"Ok": true,
+			"problem_id": newProblemId,
 		})
 	}
 
 	getProblemByIDHandler := func(c *gin.Context) {
-		problemId := c.Param("id")
-		// slice of map
-		var problems []problemsMap
-		for _, p := range testProblems {
-			if p.Id == problemId {
-				temp := problemsMap{
-					"id":    p.Id,
-					"title": p.Title,
-				}
-				problems = append(problems, temp)
-			}
+		problemId, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get problem Id err: %s", err.Error()))
+			return
 		}
 
+		var responseData Problem
+		var requesetProblem ProblemTable
+		db.Transaction(func(tx *gorm.DB) error {
+			db.First(&requesetProblem, problemId)
+			if requesetProblem.Id == 0 {
+				return nil
+			}
+
+			rows, err := tx.Model(&TestCaseTable{ProblemId: problemId}).Rows()
+			defer rows.Close()
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+			var requestTestcases []TestCase
+			for rows.Next() {
+				var testcase TestCaseTable
+				tx.ScanRows(rows, &testcase)
+
+				temp := TestCase{
+					Id:             strconv.Itoa(testcase.Id),
+					Input:          testcase.Input,
+					ExpectedOutput: testcase.ExpectedOutput,
+					Comment:        testcase.Comment,
+					Score:          testcase.Score,
+					TimeOutSeconds: testcase.TimeOutSeconds,
+				}
+
+				requestTestcases = append(requestTestcases, temp)
+			}
+
+			responseData = Problem{
+				Id:          strconv.Itoa(requesetProblem.Id),
+				Title:       requesetProblem.Title,
+				Description: requesetProblem.Description,
+				TestCases:   requestTestcases,
+			}
+
+			return nil
+		})
+
 		c.JSON(http.StatusOK, gin.H{
-			"problem": problems,
+			"data": responseData,
 		})
 	}
 
+	/* three cases
+	1. use map to record new testcases
+	2. iterate on old testcases
+	2-1. if cur testcase not in new testcases set, <delete cur testcase>
+	3. iterate on new testcases
+	3-1. if cur testcase id is empty(string -> ""), <create cur testcase>
+	3-2. else, <update cur testcase>
+	*/
 	updateProblemByIDHandler := func(c *gin.Context) {
-		problemId := c.Param("id")
-		var updatedProblem Problem
-		err := c.Bind(&updatedProblem)
+		problemId, err := strconv.Atoi(c.Param("id"))
 		if err != nil {
-			c.String(http.StatusBadRequest, fmt.Sprintf("update problem err: %s", err.Error()))
+			c.String(http.StatusBadRequest, fmt.Sprintf("get problem Id err: %s", err.Error()))
+			return
 		}
 
-		for _, p := range testProblems {
-			if p.Id == problemId {
-				p = updatedProblem
+		var updatedProblem ProblemPutDTO
+		err = c.Bind(&updatedProblem)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("update problem err: %s", err.Error()))
+			return
+		}
+
+		// record new testcases
+		newTestcasesMap := map[string]TestCasePutDTO{}
+		for _, t := range updatedProblem.TestCases {
+			if t.Id != "" {
+				newTestcasesMap[t.Id] = t
 			}
 		}
+
+		db.Transaction(func(tx *gorm.DB) error {
+			// update Problem details
+			result := tx.Model(&ProblemTable{Id: problemId}).Updates(
+				ProblemTable{Title: updatedProblem.Title, Description: updatedProblem.Description})
+			if result.RowsAffected == 0 {
+				fmt.Println("no corresponding row found")
+				return err
+			}
+
+			rows, err := tx.Model(&TestCaseTable{ProblemId: problemId}).Rows()
+			defer rows.Close()
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+			// delete cur testcase
+			var deletedTestcases []TestCasePutDTO
+			for rows.Next() {
+				var testcase TestCaseTable
+				tx.ScanRows(rows, &testcase)
+
+				_, ok := newTestcasesMap[strconv.Itoa(testcase.Id)]
+				temp := TestCasePutDTO{
+					Id: strconv.Itoa(testcase.Id),
+				}
+
+				if !ok {
+					deletedTestcases = append(deletedTestcases, temp)
+				}
+			}
+			for _, deletedTestcase := range deletedTestcases {
+				deletedId, err := strconv.Atoi(deletedTestcase.Id)
+				if err != nil {
+					fmt.Println("delete error")
+					return err
+				}
+
+				tx.Delete(&TestCaseTable{Id: deletedId})
+			}
+
+			// create & update cur testcase
+			for _, t := range updatedProblem.TestCases {
+				if t.Id == "" {
+					testcase := TestCaseTable{
+						Input:          t.Input,
+						ExpectedOutput: t.ExpectedOutput,
+						Comment:        t.Comment,
+						Score:          t.Score,
+						TimeOutSeconds: t.TimeOutSeconds,
+						ProblemId:      problemId,
+					}
+
+					tx.Create(&testcase)
+				} else {
+					updatedId, err := strconv.Atoi(t.Id)
+					if err != nil {
+						fmt.Println("update error")
+						return err
+					}
+
+					tx.Model(&TestCaseTable{Id: updatedId}).Updates(
+						TestCaseTable{
+							Input:          t.Input,
+							ExpectedOutput: t.ExpectedOutput,
+							Comment:        t.Comment,
+							Score:          t.Score,
+							TimeOutSeconds: t.TimeOutSeconds,
+						})
+				}
+			}
+
+			return nil
+		})
 
 		c.JSON(http.StatusOK, gin.H{
 			"Ok": true,
@@ -142,13 +288,18 @@ func main() {
 	}
 
 	deleteProblemByIDHandler := func(c *gin.Context) {
-		problemId := c.Param("id")
-
-		for i, p := range testProblems {
-			if p.Id == problemId {
-				testProblems = remove(testProblems, i)
-			}
+		problemId, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get problem Id err: %s", err.Error()))
+			return
 		}
+
+		db.Transaction(func(tx *gorm.DB) error {
+			tx.Where("problem_id = ?", problemId).Delete(&TestCaseTable{})
+			tx.Delete(&ProblemTable{}, problemId)
+
+			return nil
+		})
 
 		c.JSON(http.StatusOK, gin.H{
 			"Ok": true,
