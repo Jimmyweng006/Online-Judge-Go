@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strconv"
 
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -13,24 +17,34 @@ import (
 // custom map type
 type problemsMap map[string]string
 
-// Day 5 delete problem by ID api
-func remove(slice []Problem, s int) []Problem {
-	return append(slice[:s], slice[s+1:]...)
-}
+const userKey = "user"
 
 func initDatabase() (db *gorm.DB, err error) {
 	dsn := "host=localhost user=postgres password=123456789 " +
 		"dbname=onlinejudge-go port=5432 sslmode=disable"
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 
-	// postgreDB, err := db.DB()
-	// postgreDB.SetConnMaxLifetime(time.Minute)
-	// // SetMaxIdleConns sets the maximum number of connections in the idle connection pool.
-	// postgreDB.SetMaxIdleConns(10)
-	// // SetMaxOpenConns sets the maximum number of open connections to the database.
-	// postgreDB.SetMaxOpenConns(100)
-
 	return db, err
+}
+
+func encryptBySha256(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return base64.StdEncoding.EncodeToString(h[:])
+}
+
+func verifyPassword(password string, dbPassword string) bool {
+	return encryptBySha256(password) == dbPassword
+}
+
+func authorize(c *gin.Context) {
+	session := sessions.Default(c)
+	user := session.Get(userKey)
+	if user == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	c.Next()
 }
 
 func main() {
@@ -40,10 +54,16 @@ func main() {
 		return
 	}
 
-	// no transaction yet
-	db.AutoMigrate(&ProblemTable{}, &TestCaseTable{})
+	// create tables
+	db.Transaction(func(tx *gorm.DB) error {
+		tx.AutoMigrate(&ProblemTable{}, &TestCaseTable{}, &UserTable{})
+
+		return nil
+	})
 
 	r := gin.Default()
+	store := cookie.NewStore([]byte("secret"))
+	r.Use(sessions.Sessions("mysession", store))
 
 	r.GET("/", func(c *gin.Context) {
 		c.String(200, "Hello, Jimmy_kiet.")
@@ -309,11 +329,115 @@ func main() {
 	problems := r.Group("/problems")
 	{
 		problems.GET("/", getProblemsHandler)
-		problems.POST("/", createProblemsHandler)
-
 		problems.GET("/:id", getProblemByIDHandler)
+	}
+	problems.Use(authorize)
+	{
+		problems.POST("/", createProblemsHandler)
 		problems.PUT("/:id", updateProblemByIDHandler)
 		problems.DELETE("/:id", deleteProblemByIDHandler)
+	}
+
+	createUserHandler := func(c *gin.Context) {
+		var newUserDTO UserPostDTO
+		var newUser UserTable
+		var newUserId int
+
+		err := c.Bind(&newUserDTO)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("create user err: %s", err.Error()))
+			return
+		}
+		newUser = UserTable{
+			Username:  newUserDTO.Username,
+			Password:  encryptBySha256(newUserDTO.Password),
+			Name:      newUserDTO.Name,
+			Email:     newUserDTO.Email,
+			Authority: 1,
+		}
+
+		db.Transaction(func(tx *gorm.DB) error {
+			tx.Create(&newUser)
+			newUserId = newUser.Id
+
+			return nil
+		})
+
+		c.JSON(http.StatusOK, gin.H{
+			"user_id": newUserId,
+		})
+	}
+
+	loginHandler := func(c *gin.Context) {
+		var userLoginDTO UserLoginDTO
+		var userId int
+		var authority int
+		session := sessions.Default(c)
+
+		err := c.Bind(&userLoginDTO)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("login err: %s", err.Error()))
+			return
+		}
+
+		var requesetUser UserTable
+		dbError := false
+		db.Transaction(func(tx *gorm.DB) error {
+			tx.Where(&UserTable{Username: userLoginDTO.Username}).First(&requesetUser)
+			if requesetUser.Id == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "user not exist"})
+				dbError = true
+				return nil
+			}
+
+			if !verifyPassword(userLoginDTO.Password, requesetUser.Password) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "user's password doesn't match"})
+				dbError = true
+				return nil
+			}
+
+			userId = requesetUser.Id
+			authority = requesetUser.Authority
+			return nil
+		})
+		if dbError == true {
+			return
+		}
+
+		session.Set(userKey, userId)
+		if err := session.Save(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"user_id":        userId,
+			"user_authority": authority,
+		})
+	}
+
+	logoutHandler := func(c *gin.Context) {
+		session := sessions.Default(c)
+		user := session.Get(userKey)
+		if user == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid session token"})
+			return
+		}
+
+		session.Delete(userKey)
+		if err := session.Save(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{"message": "Successfully logged out"})
+	}
+
+	users := r.Group("/users")
+	{
+		users.POST("/", createUserHandler)
+		users.POST("/login", loginHandler)
+		users.POST("/logout", logoutHandler)
 	}
 
 	r.Run() // listen and serve on 0.0.0.0:8080
