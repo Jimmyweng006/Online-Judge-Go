@@ -20,3 +20,8 @@ type UserLoginDTO struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
+
+type UserIdAuthorityPrincipal struct {
+	UserId    string
+	Authority string
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/gob"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -36,7 +37,7 @@ func verifyPassword(password string, dbPassword string) bool {
 	return encryptBySha256(password) == dbPassword
 }
 
-func authorize(c *gin.Context) {
+func authorizeNormalUser(c *gin.Context) {
 	session := sessions.Default(c)
 	user := session.Get(userKey)
 	if user == nil {
@@ -47,7 +48,32 @@ func authorize(c *gin.Context) {
 	c.Next()
 }
 
+func authorizeSuperUser(c *gin.Context) {
+	session := sessions.Default(c)
+	user := session.Get(userKey)
+
+	if user == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	authority, err := strconv.Atoi(user.(UserIdAuthorityPrincipal).Authority)
+	if err != nil {
+		c.String(http.StatusUnauthorized, fmt.Sprintf("get authority err: %s", err.Error()))
+		return
+	}
+	if authority < 2 {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	c.Next()
+}
+
 func main() {
+	// init for session encode
+	gob.Register(UserIdAuthorityPrincipal{})
+
 	db, err := initDatabase()
 	if err != nil {
 		fmt.Println(err)
@@ -56,7 +82,7 @@ func main() {
 
 	// create tables
 	db.Transaction(func(tx *gorm.DB) error {
-		tx.AutoMigrate(&ProblemTable{}, &TestCaseTable{}, &UserTable{})
+		tx.AutoMigrate(&ProblemTable{}, &TestCaseTable{}, &UserTable{}, &SubmissionTable{})
 
 		return nil
 	})
@@ -104,7 +130,7 @@ func main() {
 		})
 	}
 
-	createProblemsHandler := func(c *gin.Context) {
+	createProblemHandler := func(c *gin.Context) {
 		var newProblemDTO ProblemPostDTO
 		var newProblem ProblemTable
 		var newProblemId int
@@ -331,9 +357,9 @@ func main() {
 		problems.GET("/", getProblemsHandler)
 		problems.GET("/:id", getProblemByIDHandler)
 	}
-	problems.Use(authorize)
+	problems.Use(authorizeSuperUser)
 	{
-		problems.POST("/", createProblemsHandler)
+		problems.POST("/", createProblemHandler)
 		problems.PUT("/:id", updateProblemByIDHandler)
 		problems.DELETE("/:id", deleteProblemByIDHandler)
 	}
@@ -404,7 +430,11 @@ func main() {
 			return
 		}
 
-		session.Set(userKey, userId)
+		curUser := UserIdAuthorityPrincipal{
+			UserId:    strconv.Itoa(userId),
+			Authority: strconv.Itoa(authority),
+		}
+		session.Set(userKey, curUser)
 		if err := session.Save(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save session"})
 			return
@@ -438,6 +468,107 @@ func main() {
 		users.POST("/", createUserHandler)
 		users.POST("/login", loginHandler)
 		users.POST("/logout", logoutHandler)
+	}
+
+	createSubmissionHandler := func(c *gin.Context) {
+		var newSubmissionDTO SubmissionPostDTO
+		var newSubmission SubmissionTable
+		var newSubmissionId int
+
+		session := sessions.Default(c)
+		user := session.Get(userKey)
+
+		userId, err := strconv.Atoi(user.(UserIdAuthorityPrincipal).UserId)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get user Id err: %s", err.Error()))
+			return
+		}
+
+		err = c.Bind(&newSubmissionDTO)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("create submission err: %s", err.Error()))
+			return
+		}
+		newSubmission = SubmissionTable{
+			Language:     newSubmissionDTO.Language,
+			Code:         newSubmissionDTO.Code,
+			ExecutedTime: -1.0,
+			Result:       "-",
+
+			ProblemId: newSubmissionDTO.ProblemId,
+			UserId:    userId,
+		}
+
+		db.Transaction(func(tx *gorm.DB) error {
+			tx.Create(&newSubmission)
+			newSubmissionId = newSubmission.Id
+
+			return nil
+		})
+
+		c.JSON(http.StatusOK, gin.H{
+			"submission_id": newSubmissionId,
+		})
+	}
+
+	getSubmissionByIDHandler := func(c *gin.Context) {
+		submissionId, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get submission Id err: %s", err.Error()))
+			return
+		}
+
+		session := sessions.Default(c)
+		user := session.Get(userKey)
+
+		userId, err := strconv.Atoi(user.(UserIdAuthorityPrincipal).UserId)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get user Id err: %s", err.Error()))
+			return
+		}
+
+		var responseData Submission
+		var requesetSubmission SubmissionTable
+		matchError := false
+		db.Transaction(func(tx *gorm.DB) error {
+			db.First(&requesetSubmission, submissionId)
+			if requesetSubmission.Id == 0 {
+				return nil
+			}
+
+			if requesetSubmission.UserId != userId {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "user not match"})
+				matchError = true
+				return nil
+			}
+
+			responseData = Submission{
+				Id:           requesetSubmission.Id,
+				Language:     requesetSubmission.Language,
+				Code:         requesetSubmission.Code,
+				ExecutedTime: requesetSubmission.ExecutedTime,
+				Result:       requesetSubmission.Result,
+				ProblemId:    requesetSubmission.ProblemId,
+				UserId:       requesetSubmission.UserId,
+			}
+
+			return nil
+		})
+
+		if matchError {
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"data": responseData,
+		})
+	}
+
+	submissions := r.Group("/submissions")
+	submissions.Use(authorizeNormalUser)
+	{
+		submissions.POST("/", createSubmissionHandler)
+		submissions.GET("/:id", getSubmissionByIDHandler)
 	}
 
 	r.Run() // listen and serve on 0.0.0.0:8080
