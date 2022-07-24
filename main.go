@@ -179,12 +179,12 @@ func main() {
 		var responseData Problem
 		var requesetProblem ProblemTable
 		db.Transaction(func(tx *gorm.DB) error {
-			db.First(&requesetProblem, problemId)
+			tx.First(&requesetProblem, problemId)
 			if requesetProblem.Id == 0 {
 				return nil
 			}
 
-			rows, err := tx.Model(&TestCaseTable{ProblemId: problemId}).Rows()
+			rows, err := tx.Model(&TestCaseTable{}).Where("problem_id = ?", problemId).Rows()
 			defer rows.Close()
 			if err != nil {
 				fmt.Println(err)
