@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -19,6 +22,8 @@ import (
 type problemsMap map[string]string
 
 const userKey = "user"
+const SUBMISSION_NO_RESULT = "-"
+const SUPPORTED_LANGUAGE = "kotlin"
 
 func initDatabase() (db *gorm.DB, err error) {
 	dsn := "host=localhost user=postgres password=123456789 " +
@@ -70,6 +75,21 @@ func authorizeSuperUser(c *gin.Context) {
 	c.Next()
 }
 
+func getConnection(rdb *redis.Client) error {
+	ctx := context.Background()
+	pong, err := rdb.Ping(ctx).Result()
+
+	if err != nil {
+		fmt.Println("ping error, try reconnect", err.Error())
+		rdb = redis.NewClient(&redis.Options{})
+		pong, err = rdb.Ping(ctx).Result()
+		return err
+	}
+
+	fmt.Println("ping result:", pong)
+	return nil
+}
+
 func main() {
 	// init for session encode
 	gob.Register(UserIdAuthorityPrincipal{})
@@ -79,6 +99,9 @@ func main() {
 		fmt.Println(err)
 		return
 	}
+
+	rdb := redis.NewClient(&redis.Options{})
+	defer rdb.Close()
 
 	// create tables
 	db.Transaction(func(tx *gorm.DB) error {
@@ -474,6 +497,7 @@ func main() {
 		var newSubmissionDTO SubmissionPostDTO
 		var newSubmission SubmissionTable
 		var newSubmissionId int
+		var testCaseData []JudgerTestCaseData = nil
 
 		session := sessions.Default(c)
 		user := session.Get(userKey)
@@ -503,8 +527,54 @@ func main() {
 			tx.Create(&newSubmission)
 			newSubmissionId = newSubmission.Id
 
+			rows, err := tx.Model(&TestCaseTable{}).Where("problem_id = ?", newSubmissionDTO.ProblemId).Rows()
+			defer rows.Close()
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+			for rows.Next() {
+				var testcase TestCaseTable
+				tx.ScanRows(rows, &testcase)
+
+				temp := JudgerTestCaseData{
+					Input:          testcase.Input,
+					ExpectedOutput: testcase.ExpectedOutput,
+					Score:          testcase.Score,
+					TimeOutSeconds: testcase.TimeOutSeconds,
+				}
+
+				testCaseData = append(testCaseData, temp)
+			}
+
 			return nil
 		})
+
+		if newSubmissionId != 0 && testCaseData != nil {
+			if err = getConnection(rdb); err == nil {
+				judgerSubmissionData := JudgerSubmissionData{
+					Id:        newSubmissionId,
+					Language:  newSubmission.Language,
+					Code:      newSubmission.Code,
+					TestCases: testCaseData,
+				}
+
+				// todo: check correctness
+				bytes, err := json.Marshal(judgerSubmissionData)
+				if err != nil {
+					panic(err)
+				}
+
+				ctx := context.Background()
+				_, err = rdb.RPush(ctx, newSubmission.Language, bytes).Result()
+				if err != nil {
+					panic(err)
+				}
+			} else {
+				fmt.Println(err)
+			}
+		}
 
 		c.JSON(http.StatusOK, gin.H{
 			"submission_id": newSubmissionId,
@@ -531,8 +601,10 @@ func main() {
 		var requesetSubmission SubmissionTable
 		matchError := false
 		db.Transaction(func(tx *gorm.DB) error {
-			db.First(&requesetSubmission, submissionId)
+			tx.First(&requesetSubmission, submissionId)
 			if requesetSubmission.Id == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "submissionId not match"})
+				matchError = true
 				return nil
 			}
 
@@ -564,11 +636,201 @@ func main() {
 		})
 	}
 
+	restartSubmissionsHandler := func(c *gin.Context) {
+		var unjudgedSubmissionDataList []JudgerSubmissionData = nil
+		var problem_ids []int
+		judgerTestCasesMap := make(map[int][]JudgerTestCaseData)
+		submissionsMap := make(map[int][]SubmissionTable)
+		isOK := true
+
+		db.Transaction(func(tx *gorm.DB) error {
+			// 1. find all unjudged submissoins and its problemId
+			rows, err := tx.Model(&SubmissionTable{}).Where("result = ?", SUBMISSION_NO_RESULT).Rows()
+			defer rows.Close()
+			if err != nil {
+				return err
+			}
+
+			for rows.Next() {
+				var submission SubmissionTable
+				tx.ScanRows(rows, &submission)
+
+				problem_ids = append(problem_ids, submission.ProblemId)
+				submissionsMap[submission.ProblemId] = append(submissionsMap[submission.ProblemId], submission)
+			}
+			// 2. find it's related testCases
+			rows, err = tx.Model(&TestCaseTable{}).Where("problem_id IN ?", problem_ids).Rows()
+			defer rows.Close()
+			if err != nil {
+				return err
+			}
+
+			for rows.Next() {
+				var testCase TestCaseTable
+				tx.ScanRows(rows, &testCase)
+
+				judgerTestCase := JudgerTestCaseData{
+					Input:          testCase.Input,
+					ExpectedOutput: testCase.ExpectedOutput,
+					Score:          testCase.Score,
+					TimeOutSeconds: testCase.TimeOutSeconds,
+				}
+
+				judgerTestCasesMap[testCase.ProblemId] = append(judgerTestCasesMap[testCase.ProblemId], judgerTestCase)
+			}
+
+			return nil
+		})
+
+		// 3. combine to JudgerSubmissionData and push to Redis
+		for _, submissions := range submissionsMap {
+			for _, submission := range submissions {
+				judgerSubmissionData := JudgerSubmissionData{
+					Id:        submission.Id,
+					Language:  submission.Language,
+					Code:      submission.Code,
+					TestCases: judgerTestCasesMap[submission.ProblemId],
+				}
+
+				unjudgedSubmissionDataList = append(unjudgedSubmissionDataList, judgerSubmissionData)
+			}
+		}
+
+		if unjudgedSubmissionDataList != nil {
+			for _, unjudgedSubmissionData := range unjudgedSubmissionDataList {
+				if err = getConnection(rdb); err != nil {
+					isOK = false
+					c.JSON(http.StatusInternalServerError, gin.H{
+						"redis": "disconnection",
+					})
+					return
+				}
+
+				bytes, err := json.Marshal(unjudgedSubmissionData)
+				if err != nil {
+					panic(err)
+				}
+
+				ctx := context.Background()
+				_, err = rdb.RPush(ctx, unjudgedSubmissionData.Language, bytes).Result()
+				if err != nil {
+					panic(err)
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"data": isOK,
+		})
+	}
+
+	restartSubmissionByIDHandler := func(c *gin.Context) {
+		submissionId, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get submission Id err: %s", err.Error()))
+			return
+		}
+
+		session := sessions.Default(c)
+		user := session.Get(userKey)
+
+		userId, err := strconv.Atoi(user.(UserIdAuthorityPrincipal).UserId)
+		if err != nil {
+			c.String(http.StatusBadRequest, fmt.Sprintf("get user Id err: %s", err.Error()))
+			return
+		}
+
+		var requesetSubmission SubmissionTable
+		var judgerTestCases []JudgerTestCaseData
+		matchError := false
+		isOK := true
+
+		db.Transaction(func(tx *gorm.DB) error {
+			// 1. check submission id exist or not
+			tx.First(&requesetSubmission, submissionId)
+			if requesetSubmission.Id == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "submissionId not match"})
+				matchError = true
+				return nil
+			}
+
+			// 2. check submission.user is cur user or not
+			if requesetSubmission.UserId != userId {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "user not match"})
+				matchError = true
+				return nil
+			}
+
+			// 3. find submission related testCases
+			rows, err := tx.Model(&TestCaseTable{}).Where("problem_id = ?", requesetSubmission.ProblemId).Rows()
+			defer rows.Close()
+			if err != nil {
+				return err
+			}
+
+			for rows.Next() {
+				var testCase TestCaseTable
+				tx.ScanRows(rows, &testCase)
+
+				judgerTestCase := JudgerTestCaseData{
+					Input:          testCase.Input,
+					ExpectedOutput: testCase.ExpectedOutput,
+					Score:          testCase.Score,
+					TimeOutSeconds: testCase.TimeOutSeconds,
+				}
+
+				judgerTestCases = append(judgerTestCases, judgerTestCase)
+			}
+
+			return nil
+		})
+
+		if matchError {
+			return
+		}
+
+		// 4. combine submission and testCases to JudgerSubmissionData, push JudgerSubmissionData to Redis
+		if err = getConnection(rdb); err != nil {
+			isOK = false
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"redis": "disconnection",
+			})
+			return
+		}
+
+		// todo: check correctness
+		unjudgedSubmissionData := JudgerSubmissionData{
+			Id:        requesetSubmission.Id,
+			Language:  requesetSubmission.Language,
+			Code:      requesetSubmission.Code,
+			TestCases: judgerTestCases,
+		}
+		bytes, err := json.Marshal(unjudgedSubmissionData)
+		if err != nil {
+			panic(err)
+		}
+
+		ctx := context.Background()
+		_, err = rdb.RPush(ctx, unjudgedSubmissionData.Language, bytes).Result()
+		if err != nil {
+			panic(err)
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"data": isOK,
+		})
+	}
+
 	submissions := r.Group("/submissions")
 	submissions.Use(authorizeNormalUser)
 	{
 		submissions.POST("/", createSubmissionHandler)
 		submissions.GET("/:id", getSubmissionByIDHandler)
+		submissions.POST("/:id/restart", restartSubmissionByIDHandler)
+	}
+	submissions.Use(authorizeSuperUser)
+	{
+		submissions.POST("/restart", restartSubmissionsHandler)
 	}
 
 	r.Run() // listen and serve on 0.0.0.0:8080
